@@ -42,4 +42,19 @@ CONFIDENCE SCORE:
 Assign a numeric confidence rating (0 to 100) representing how strongly the policy clauses align with counteracting the denial reasons.
 
 DISCLAIMER:
-Add a medical disclaimer stating that this analysis is generated using AI and should be reviewed by a professional before submission.`;
+Add a medical disclaimer stating that this analysis is generated using AI and should be reviewed by a professional before submission.
+
+OUTPUT FORMAT:
+You must respond with ONLY a valid JSON object using exactly these keys:
+{
+  "denialSummary": "string - brief summary of the denial",
+  "denialReason": "string - specific reason for denial",
+  "policyClause": "string - verbatim matching policy clause text",
+  "pageReference": "string - page/section reference in policy",
+  "plainEnglishExplanation": "string - explanation in plain language",
+  "appealStrength": "High" | "Medium" | "Low",
+  "appealLetter": "string - complete formatted appeal letter",
+  "confidence": number (0-100),
+  "disclaimer": "string - AI disclaimer",
+  "nextSteps": ["string array of actionable next steps"]
+}`;

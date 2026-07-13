@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import Groq from "groq-sdk";
 import { CLAIM_ANALYSIS_PROMPT } from "./prompts";
 import { AnalysisSchema, type AnalysisResult } from "./types";
 import { logger } from "./logger";
@@ -16,7 +16,7 @@ export class GeminiAPIError extends Error {
 }
 
 /**
- * Interface representing base64 document attachments passed to the Gemini SDK.
+ * Interface representing document attachments passed to the AI model.
  */
 export interface DocumentInput {
   base64: string;
@@ -30,7 +30,7 @@ export interface DocumentInput {
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   retries = 3,
-  delayMs = 1000
+  delayMs = 2000
 ): Promise<T> {
   try {
     return await fn();
@@ -46,116 +46,143 @@ async function retryWithBackoff<T>(
       throw error;
     }
 
-    logger.warn(`[Gemini API Transient Warning] API call failed. Retrying in ${delayMs}ms. Attempts remaining: ${retries - 1}. Error was:`, error);
+    logger.warn(`[AI API Transient Warning] API call failed. Retrying in ${delayMs}ms. Attempts remaining: ${retries - 1}. Error was:`, error);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     return retryWithBackoff(fn, retries - 1, delayMs * 2);
   }
 }
 
 /**
- * Dispatches denial and policy documents as a multimodal base64 payload to Gemini 2.5 Pro,
+ * Extracts text from a PDF file buffer using pdfjs-dist (no worker needed).
+ */
+async function extractPdfText(base64Data: string): Promise<string> {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const buffer = Buffer.from(base64Data, "base64");
+  const data = new Uint8Array(buffer);
+
+  const doc = await pdfjsLib.getDocument({ data, useSystemFonts: true }).promise;
+  const textParts: string[] = [];
+
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items
+      .map((item: { str?: string }) => item.str || "")
+      .join(" ");
+    textParts.push(pageText);
+  }
+
+  return textParts.join("\n\n");
+}
+
+/**
+ * Dispatches denial and policy documents to Groq's Llama 4 Scout model,
  * parses the structured output, and validates it against the shared Zod schema.
  */
 export async function analyzeDocuments(
   denial: DocumentInput,
   policy: DocumentInput
 ): Promise<AnalysisResult> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    throw new GeminiAPIError("Gemini API key is missing.", 500);
+    throw new GeminiAPIError("Groq API key is missing. Please set GROQ_API_KEY in .env.local", 500);
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const groq = new Groq({ apiKey });
 
-  // 1. Build user contents containing base64 attachments and direct task instruction
-  const contents: Array<string | { inlineData: { data: string; mimeType: string } }> = [
-    "Task Instruction: Review the attached claim denial letter and policy contract document. Analyze why the claim was denied, locate matching clauses in the policy document, and generate the structured JSON appeal mapping.",
+  // Build message content parts
+  // Groq supports images natively via base64, but PDFs must be converted to text
+  type ContentPart =
+    | { type: "text"; text: string }
+    | { type: "image_url"; image_url: { url: string } };
+
+  const contentParts: ContentPart[] = [
     {
-      inlineData: {
-        data: denial.base64,
-        mimeType: denial.mimeType,
-      },
-    },
-    {
-      inlineData: {
-        data: policy.base64,
-        mimeType: policy.mimeType,
-      },
+      type: "text",
+      text: "Task Instruction: Review the attached claim denial letter and policy contract document. Analyze why the claim was denied, locate matching clauses in the policy document, and generate the structured JSON appeal mapping.",
     },
   ];
 
-  // 2. Query Gemini Pro, passing grounding rules as system instructions
-  const generateContentCall = async () => {
-    try {
-      const response = await ai.models.generateContent({
-        model: "gemini-2.0-flash-lite",
-        contents,
-        config: {
-          systemInstruction: CLAIM_ANALYSIS_PROMPT,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              denialSummary: { type: Type.STRING },
-              denialReason: { type: Type.STRING },
-              policyClause: { type: Type.STRING },
-              pageReference: { type: Type.STRING },
-              plainEnglishExplanation: { type: Type.STRING },
-              appealStrength: { 
-                type: Type.STRING,
-                enum: ["High", "Medium", "Low"],
-              },
-              appealLetter: { type: Type.STRING },
-              confidence: { type: Type.INTEGER },
-              disclaimer: { type: Type.STRING },
-              nextSteps: { 
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-            },
-            required: [
-              "denialSummary",
-              "denialReason",
-              "policyClause",
-              "pageReference",
-              "plainEnglishExplanation",
-              "appealStrength",
-              "appealLetter",
-              "confidence",
-              "disclaimer",
-              "nextSteps",
-            ],
-          },
-        },
-      });
+  // Process denial document
+  if (denial.mimeType === "application/pdf") {
+    const denialText = await extractPdfText(denial.base64);
+    contentParts.push({
+      type: "text",
+      text: `--- DENIAL LETTER (${denial.name}) ---\n${denialText}\n--- END DENIAL LETTER ---`,
+    });
+  } else {
+    // Image — send directly as base64
+    contentParts.push({
+      type: "image_url",
+      image_url: { url: `data:${denial.mimeType};base64,${denial.base64}` },
+    });
+  }
 
-      return response.text || "";
+  // Process policy document
+  if (policy.mimeType === "application/pdf") {
+    const policyText = await extractPdfText(policy.base64);
+    contentParts.push({
+      type: "text",
+      text: `--- POLICY DOCUMENT (${policy.name}) ---\n${policyText}\n--- END POLICY DOCUMENT ---`,
+    });
+  } else {
+    // Image — send directly as base64
+    contentParts.push({
+      type: "image_url",
+      image_url: { url: `data:${policy.mimeType};base64,${policy.base64}` },
+    });
+  }
+
+  const generateCall = async () => {
+    try {
+      const response = await groq.chat.completions.create({
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        messages: [
+          {
+            role: "system",
+            content: CLAIM_ANALYSIS_PROMPT,
+          },
+          {
+            role: "user",
+            content: contentParts,
+          },
+        ],
+        response_format: {
+          type: "json_object",
+        },
+        temperature: 0.3,
+        max_tokens: 4096,
+        stream: false,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any);
+
+      return response.choices[0]?.message?.content || "";
     } catch (apiError: unknown) {
       const message = apiError instanceof Error ? apiError.message : String(apiError);
 
-      if (message.includes("API key not valid") || message.includes("400") || message.includes("403")) {
-        throw new GeminiAPIError("Invalid Gemini API Key provided.", 403);
+      if (message.includes("API key") || message.includes("401") || message.includes("403")) {
+        throw new GeminiAPIError("Invalid Groq API Key provided.", 403);
       }
       if (message.includes("429") || message.toLowerCase().includes("rate limit") || message.toLowerCase().includes("quota")) {
-        throw new GeminiAPIError("Gemini is busy. Please try again in a few seconds.", 429);
+        throw new GeminiAPIError("Groq is busy. Please try again in a few seconds.", 429);
       }
       if (message.includes("408") || message.includes("504") || message.toLowerCase().includes("timeout") || message.toLowerCase().includes("deadline")) {
         throw new GeminiAPIError("The AI model took too long to respond.", 504);
       }
 
-      throw new GeminiAPIError(`Gemini API request failed: ${message}`, 502);
+      throw new GeminiAPIError(`Groq API request failed: ${message}`, 502);
     }
   };
 
-  logger.info("Sending request to Gemini 2.5 Pro...");
-  const responseText = await retryWithBackoff(generateContentCall);
-  logger.info("Response received from Gemini API.");
+  logger.info("Sending request to Groq Llama 4 Scout...");
+  const responseText = await retryWithBackoff(generateCall);
+  logger.info("Response received from Groq API.");
 
   if (!responseText) {
-    throw new GeminiAPIError("Empty response received from Gemini API.", 502);
+    throw new GeminiAPIError("Empty response received from Groq API.", 502);
   }
 
-  // 3. Clean and parse JSON response
+  // Clean and parse JSON response
   let parsedData: unknown;
   try {
     let cleanText = responseText.trim();
@@ -166,16 +193,16 @@ export async function analyzeDocuments(
     }
     parsedData = JSON.parse(cleanText);
   } catch (parseError: unknown) {
-    logger.error("Gemini JSON Parse Error:", parseError, "Response text was:", responseText);
-    throw new GeminiAPIError("Failed to parse Gemini response as JSON.", 500);
+    logger.error("Groq JSON Parse Error:", parseError, "Response text was:", responseText);
+    throw new GeminiAPIError("Failed to parse Groq response as JSON.", 500);
   }
 
-  // 4. Validate output shape using Zod schema
+  // Validate output shape using Zod schema
   const validated = AnalysisSchema.safeParse(parsedData);
   if (!validated.success) {
-    logger.error("Gemini Schema Validation Failed. Zod error details:", validated.error.format());
-    logger.error("Gemini Schema Validation Failed. Raw response text was:", responseText);
-    
+    logger.error("Groq Schema Validation Failed. Zod error details:", validated.error.format());
+    logger.error("Groq Schema Validation Failed. Raw response text was:", responseText);
+
     const firstError = validated.error.issues[0]?.message || "Schema validation mismatch";
     throw new GeminiAPIError(`Invalid AI response shape: ${firstError}`, 422);
   }

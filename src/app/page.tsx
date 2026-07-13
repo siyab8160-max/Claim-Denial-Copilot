@@ -105,17 +105,35 @@ export default function Home() {
         signal: controller.signal,
       });
 
+      // Guard: ensure the response is JSON before parsing
+      const responseContentType = response.headers.get("content-type") || "";
+      const isJsonResponse = responseContentType.includes("application/json");
+
       if (!response.ok) {
         let title = "Analysis Failed";
         let message = "An error occurred while communicating with the server.";
-        try {
-          const errJson = await response.json();
-          title = errJson.title || title;
-          message = errJson.message || message;
-        } catch {
-          // Fallback to HTTP status text
+        if (isJsonResponse) {
+          try {
+            const errJson = await response.json();
+            title = errJson.title || title;
+            message = errJson.message || message;
+          } catch {
+            // Fallback to HTTP status text
+          }
+        } else {
+          title = "Server Error";
+          message = `The server returned an unexpected response (HTTP ${response.status}). Please restart the development server and try again.`;
         }
         throw new Error(JSON.stringify({ title, message }));
+      }
+
+      if (!isJsonResponse) {
+        throw new Error(
+          JSON.stringify({
+            title: "Unexpected Response",
+            message: "The server responded with a non-JSON format. Please restart the development server and try again.",
+          })
+        );
       }
 
       const data = await response.json();
